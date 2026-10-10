@@ -1,0 +1,15 @@
+[package]
+name = "gray-webchat"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Local webchat channel for the gray agent harness (127.0.0.1 HTTP, host.turn-driven)"
+license = "MIT"
+[lib]
+name = "webchat_plugin"
+path = "src/lib.rs"
+[[bin]]
+name = "webchat"
+path = "src/main.rs"
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
