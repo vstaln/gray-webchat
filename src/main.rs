@@ -218,6 +218,9 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("manifest") => println!("{}", manifest()),
         Some("sidecar") => { let _ = sidecar(); }
+        Some("-h" | "--help" | "help") => {
+            println!("webchat — local chat at http://127.0.0.1:{} (lives while gray runs)", DEFAULT_PORT);
+        }
         _ => {
             if args.is_empty() {
                 if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
