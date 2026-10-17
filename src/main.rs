@@ -48,6 +48,7 @@ struct Shared {
     waiters: HashMap<String, u64>,
     log: Vec<Value>,
     next_n: AtomicU64,
+    bound: Option<Result<u16, String>>,
 }
 
 fn config() -> u16 {
@@ -151,6 +152,7 @@ fn sidecar() -> std::io::Result<()> {
         waiters: HashMap::new(),
         log: Vec::new(),
         next_n: AtomicU64::new(0),
+        bound: None,
     }));
     let cv = Arc::new(std::sync::Condvar::new());
     let out = Arc::new(Mutex::new(std::io::stdout()));
@@ -166,9 +168,13 @@ fn sidecar() -> std::io::Result<()> {
                 if let Ok(s) = s { let (sh3, cv3) = (sh2.clone(), cv2.clone());
                     std::thread::spawn(move || http_conn(s, sh3, cv3)); }
             });
+            sh.lock().unwrap().bound = Some(Ok(port));
             append_log(&sh, "sys", format!("webchat listening on http://127.0.0.1:{port}"));
         }
-        Err(e) => append_log(&sh, "sys", format!("bind :{port} failed: {e}")),
+        Err(e) => {
+            sh.lock().unwrap().bound = Some(Err(e.to_string()));
+            append_log(&sh, "sys", format!("bind :{port} failed: {e}"));
+        }
     }
 
     let stdin = std::io::stdin();
@@ -196,8 +202,12 @@ fn sidecar() -> std::io::Result<()> {
                 let reply = if method == "plugin/manifest" {
                     json!({"id": id, "result": manifest()})
                 } else if method == "command/run" {
-                    json!({"id": id, "result": {"text":
-                        format!("webchat at http://127.0.0.1:{port}")}})
+                    let text = match sh.lock().unwrap().bound.clone() {
+                        Some(Ok(p)) => format!("webchat at http://127.0.0.1:{p}"),
+                        Some(Err(e)) => format!("webchat not listening — bind 127.0.0.1:{port} failed: {e}"),
+                        None => format!("webchat starting on 127.0.0.1:{port}"),
+                    };
+                    json!({"id": id, "result": {"text": text}})
                 } else {
                     json!({"id": id, "error": {"code": -32601,
                         "message": format!("method not found: {method}")}})
