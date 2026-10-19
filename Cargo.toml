@@ -1,6 +1,6 @@
 [package]
 name = "gray-webchat"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.88"
 description = "Local webchat channel for the gray agent harness (127.0.0.1 HTTP, host.turn-driven)"
