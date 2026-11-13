@@ -20,6 +20,7 @@ fn manifest() -> Value {
         "version": env!("CARGO_PKG_VERSION"), "protocol": "1.1",
         "capabilities": ["host.turn"],
         "commands": ["/webchat"], "subcommands": ["webchat"],
+        "command_descriptions": {"/webchat": "serve a browser chat for this session"},
         "tools": [],
     })
 }
@@ -48,6 +49,7 @@ struct Shared {
     waiters: HashMap<String, u64>,
     log: Vec<Value>,
     next_n: AtomicU64,
+    bound: Option<Result<u16, String>>,
 }
 
 fn config() -> u16 {
@@ -69,13 +71,42 @@ fn resp(s: &mut TcpStream, code: u16, body: &str, ctype: &str) {
 }
 
 fn http_conn(mut s: TcpStream, sh: Arc<Mutex<Shared>>, cv: Arc<std::sync::Condvar>) {
-    let mut buf = [0u8; 16384];
-    let Ok(n) = s.read(&mut buf) else { return };
-    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-    let mut parts = req.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("/");
-    match (method, path.split('?').next().unwrap_or("/")) {
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let mut buf = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        if buf.len() > 64 * 1024 {
+            return;
+        }
+        match s.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let mut parts = head.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+    let mut clen = 0usize;
+    for l in head.lines().skip(1) {
+        if let Some((k, v)) = l.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                clen = v.trim().parse().unwrap_or(0).min(1024 * 1024);
+            }
+        }
+    }
+    while buf.len() < head_end + clen {
+        match s.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let body = String::from_utf8_lossy(&buf[head_end..buf.len().min(head_end + clen)])
+        .into_owned();
+    match (method.as_str(), path.split('?').next().unwrap_or("/")) {
         ("GET", "/") => resp(&mut s, 200, PAGE, "text/html"),
         ("GET", "/log") => {
             let after: u64 = path.split("after=").nth(1)
@@ -86,8 +117,7 @@ fn http_conn(mut s: TcpStream, sh: Arc<Mutex<Shared>>, cv: Arc<std::sync::Condva
             resp(&mut s, 200, &json!({"messages": msgs}).to_string(), "application/json");
         }
         ("POST", "/send") => {
-            let body = req.split("\r\n\r\n").nth(1).unwrap_or("{}");
-            let v: Value = serde_json::from_str(body).unwrap_or(json!({}));
+            let v: Value = serde_json::from_str(&body).unwrap_or(json!({}));
             let text = v["text"].as_str().unwrap_or("").trim().to_string();
             if text.is_empty() { resp(&mut s, 400, "{\"error\":\"empty\"}", "application/json"); return; }
             let mut g = sh.lock().unwrap();
@@ -151,6 +181,7 @@ fn sidecar() -> std::io::Result<()> {
         waiters: HashMap::new(),
         log: Vec::new(),
         next_n: AtomicU64::new(0),
+        bound: None,
     }));
     let cv = Arc::new(std::sync::Condvar::new());
     let out = Arc::new(Mutex::new(std::io::stdout()));
@@ -166,9 +197,13 @@ fn sidecar() -> std::io::Result<()> {
                 if let Ok(s) = s { let (sh3, cv3) = (sh2.clone(), cv2.clone());
                     std::thread::spawn(move || http_conn(s, sh3, cv3)); }
             });
+            sh.lock().unwrap().bound = Some(Ok(port));
             append_log(&sh, "sys", format!("webchat listening on http://127.0.0.1:{port}"));
         }
-        Err(e) => append_log(&sh, "sys", format!("bind :{port} failed: {e}")),
+        Err(e) => {
+            sh.lock().unwrap().bound = Some(Err(e.to_string()));
+            append_log(&sh, "sys", format!("bind :{port} failed: {e}"));
+        }
     }
 
     let stdin = std::io::stdin();
@@ -196,8 +231,12 @@ fn sidecar() -> std::io::Result<()> {
                 let reply = if method == "plugin/manifest" {
                     json!({"id": id, "result": manifest()})
                 } else if method == "command/run" {
-                    json!({"id": id, "result": {"text":
-                        format!("webchat at http://127.0.0.1:{port}")}})
+                    let text = match sh.lock().unwrap().bound.clone() {
+                        Some(Ok(p)) => format!("webchat at http://127.0.0.1:{p}"),
+                        Some(Err(e)) => format!("webchat not listening — bind 127.0.0.1:{port} failed: {e}"),
+                        None => format!("webchat starting on 127.0.0.1:{port}"),
+                    };
+                    json!({"id": id, "result": {"text": text}})
                 } else {
                     json!({"id": id, "error": {"code": -32601,
                         "message": format!("method not found: {method}")}})
