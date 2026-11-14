@@ -19,7 +19,7 @@ fn manifest() -> Value {
         "name": NAME, "display_name": "WebChat",
         "version": env!("CARGO_PKG_VERSION"), "protocol": "1.1",
         "capabilities": ["host.turn"],
-        "description": "chat",
+        "description": "chat with gray from a local web page",
         "commands": ["/webchat"], "subcommands": ["webchat"],
         "command_descriptions": {"/webchat": "serve a browser chat for this session"},
         "tools": [],
