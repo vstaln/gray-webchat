@@ -227,11 +227,9 @@ fn sidecar() -> std::io::Result<()> {
         Ok(l) => {
             let (sh2, cv2) = (sh.clone(), cv.clone());
             std::thread::spawn(move || {
-                for s in l.incoming() {
-                    if let Ok(s) = s {
-                        let (sh3, cv3) = (sh2.clone(), cv2.clone());
-                        std::thread::spawn(move || http_conn(s, sh3, cv3));
-                    }
+                for s in l.incoming().flatten() {
+                    let (sh3, cv3) = (sh2.clone(), cv2.clone());
+                    std::thread::spawn(move || http_conn(s, sh3, cv3));
                 }
             });
             sh.lock().unwrap().bound = Some(Ok(port));
