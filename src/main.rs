@@ -4,12 +4,12 @@
 //! capability — `gray plugin capabilities webchat --all`), and the
 //! agent's reply lands in the ring buffer that GET /log serves.
 
+use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use serde_json::{json, Value};
 
 const NAME: &str = "webchat";
 const DEFAULT_PORT: u16 = 8889;
@@ -54,21 +54,28 @@ struct Shared {
 }
 
 fn config() -> u16 {
-    let home = std::env::var_os("GRAY_HOME").map(std::path::PathBuf::from)
+    let home = std::env::var_os("GRAY_HOME")
+        .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".gray")))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let p = home.join("webchat").join("config.json");
-    std::fs::read_to_string(p).ok()
+    std::fs::read_to_string(p)
+        .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|c| c["port"].as_u64().map(|p| p as u16))
-        .or_else(|| std::env::var("WEBCHAT_PORT").ok().and_then(|s| s.parse().ok()))
+        .or_else(|| {
+            std::env::var("WEBCHAT_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
         .unwrap_or(DEFAULT_PORT)
 }
 
 fn resp(s: &mut TcpStream, code: u16, body: &str, ctype: &str) {
     let head = format!("HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         match code { 200 => "OK", 202 => "Accepted", 404 => "Not Found", _ => "Error" }, body.len());
-    let _ = s.write_all(head.as_bytes()); let _ = s.write_all(body.as_bytes());
+    let _ = s.write_all(head.as_bytes());
+    let _ = s.write_all(body.as_bytes());
 }
 
 fn http_conn(mut s: TcpStream, sh: Arc<Mutex<Shared>>, cv: Arc<std::sync::Condvar>) {
@@ -105,28 +112,47 @@ fn http_conn(mut s: TcpStream, sh: Arc<Mutex<Shared>>, cv: Arc<std::sync::Condva
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
     }
-    let body = String::from_utf8_lossy(&buf[head_end..buf.len().min(head_end + clen)])
-        .into_owned();
+    let body = String::from_utf8_lossy(&buf[head_end..buf.len().min(head_end + clen)]).into_owned();
     match (method.as_str(), path.split('?').next().unwrap_or("/")) {
         ("GET", "/") => resp(&mut s, 200, PAGE, "text/html"),
         ("GET", "/log") => {
-            let after: u64 = path.split("after=").nth(1)
-                .and_then(|v| v.parse().ok()).unwrap_or(0);
+            let after: u64 = path
+                .split("after=")
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let g = sh.lock().unwrap();
-            let msgs: Vec<Value> = g.log.iter()
-                .filter(|m| m["n"].as_u64().unwrap_or(0) > after).cloned().collect();
-            resp(&mut s, 200, &json!({"messages": msgs}).to_string(), "application/json");
+            let msgs: Vec<Value> = g
+                .log
+                .iter()
+                .filter(|m| m["n"].as_u64().unwrap_or(0) > after)
+                .cloned()
+                .collect();
+            resp(
+                &mut s,
+                200,
+                &json!({"messages": msgs}).to_string(),
+                "application/json",
+            );
         }
         ("POST", "/send") => {
             let v: Value = serde_json::from_str(&body).unwrap_or(json!({}));
             let text = v["text"].as_str().unwrap_or("").trim().to_string();
-            if text.is_empty() { resp(&mut s, 400, "{\"error\":\"empty\"}", "application/json"); return; }
+            if text.is_empty() {
+                resp(&mut s, 400, "{\"error\":\"empty\"}", "application/json");
+                return;
+            }
             let mut g = sh.lock().unwrap();
             let id = g.next_n.fetch_add(1, Ordering::SeqCst) + 1;
             g.log.push(json!({"n": id, "who": "you", "text": text}));
             g.queue.push_back((id, text));
             cv.notify_one();
-            resp(&mut s, 202, &json!({"id": id}).to_string(), "application/json");
+            resp(
+                &mut s,
+                202,
+                &json!({"id": id}).to_string(),
+                "application/json",
+            );
         }
         _ => resp(&mut s, 404, "{}", "application/json"),
     }
@@ -136,14 +162,15 @@ fn append_log(sh: &Arc<Mutex<Shared>>, who: &str, text: String) {
     let mut g = sh.lock().unwrap();
     let n = g.next_n.fetch_add(1, Ordering::SeqCst) + 1;
     g.log.push(json!({"n": n, "who": who, "text": text}));
-    if g.log.len() > 400 { g.log.remove(0); }
+    if g.log.len() > 400 {
+        g.log.remove(0);
+    }
 }
 
 /// Pump thread: blocks on the condvar until /send enqueues, then writes
 /// one `host/run` per queued message through the shared wire writer —
 /// independent of stdin traffic, so messages flow while the host is idle.
-fn pump(sh: Arc<Mutex<Shared>>, cv: Arc<std::sync::Condvar>,
-        out: Arc<Mutex<std::io::Stdout>>) {
+fn pump(sh: Arc<Mutex<Shared>>, cv: Arc<std::sync::Condvar>, out: Arc<Mutex<std::io::Stdout>>) {
     let mut counter = 0u64;
     let mut g = sh.lock().unwrap();
     loop {
@@ -156,8 +183,12 @@ fn pump(sh: Arc<Mutex<Shared>>, cv: Arc<std::sync::Condvar>,
         g.waiters.insert(wid.clone(), num);
         drop(g);
         let mut w = out.lock().unwrap();
-        let _ = writeln!(w, "{}", json!({"id": wid, "method": "host/run",
-            "params": {"prompt": text}}));
+        let _ = writeln!(
+            w,
+            "{}",
+            json!({"id": wid, "method": "host/run",
+            "params": {"prompt": text}})
+        );
         let _ = w.flush();
         drop(w);
         g = sh.lock().unwrap();
@@ -167,7 +198,8 @@ fn pump(sh: Arc<Mutex<Shared>>, cv: Arc<std::sync::Condvar>,
 fn fulfill_waiters(sh: &Arc<Mutex<Shared>>, id: &str, result: &Value) {
     let found = sh.lock().unwrap().waiters.remove(id).is_some();
     if found {
-        let text = result["text"].as_str()
+        let text = result["text"]
+            .as_str()
             .or_else(|| result["output"].as_str())
             .or_else(|| result.pointer("/result/text").and_then(Value::as_str))
             .map(str::to_string)
@@ -194,12 +226,20 @@ fn sidecar() -> std::io::Result<()> {
     match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => {
             let (sh2, cv2) = (sh.clone(), cv.clone());
-            std::thread::spawn(move || for s in l.incoming() {
-                if let Ok(s) = s { let (sh3, cv3) = (sh2.clone(), cv2.clone());
-                    std::thread::spawn(move || http_conn(s, sh3, cv3)); }
+            std::thread::spawn(move || {
+                for s in l.incoming() {
+                    if let Ok(s) = s {
+                        let (sh3, cv3) = (sh2.clone(), cv2.clone());
+                        std::thread::spawn(move || http_conn(s, sh3, cv3));
+                    }
+                }
             });
             sh.lock().unwrap().bound = Some(Ok(port));
-            append_log(&sh, "sys", format!("webchat listening on http://127.0.0.1:{port}"));
+            append_log(
+                &sh,
+                "sys",
+                format!("webchat listening on http://127.0.0.1:{port}"),
+            );
         }
         Err(e) => {
             sh.lock().unwrap().bound = Some(Err(e.to_string()));
@@ -210,7 +250,9 @@ fn sidecar() -> std::io::Result<()> {
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = line?;
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let method = v["method"].as_str().unwrap_or("");
         match v.get("id").cloned() {
             None if method == "plugin/shutdown" => return Ok(()),
@@ -234,7 +276,9 @@ fn sidecar() -> std::io::Result<()> {
                 } else if method == "command/run" {
                     let text = match sh.lock().unwrap().bound.clone() {
                         Some(Ok(p)) => format!("webchat at http://127.0.0.1:{p}"),
-                        Some(Err(e)) => format!("webchat not listening — bind 127.0.0.1:{port} failed: {e}"),
+                        Some(Err(e)) => {
+                            format!("webchat not listening — bind 127.0.0.1:{port} failed: {e}")
+                        }
                         None => format!("webchat starting on 127.0.0.1:{port}"),
                     };
                     json!({"id": id, "result": {"text": text}})
@@ -254,22 +298,34 @@ fn sidecar() -> std::io::Result<()> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<String> = match args.first().map(String::as_str) {
-        Some("webchat") => args[1..].to_vec(), _ => args };
+        Some("webchat") => args[1..].to_vec(),
+        _ => args,
+    };
     match args.first().map(String::as_str) {
         Some("manifest") => println!("{}", manifest()),
-        Some("sidecar") => { let _ = sidecar(); }
+        Some("sidecar") => {
+            let _ = sidecar();
+        }
         Some("-h" | "--help" | "help") => {
-            println!("webchat — local chat at http://127.0.0.1:{} (lives while gray runs)", DEFAULT_PORT);
+            println!(
+                "webchat — local chat at http://127.0.0.1:{} (lives while gray runs)",
+                DEFAULT_PORT
+            );
         }
         _ => {
             if args.is_empty() {
                 if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                    println!("webchat — local chat at http://127.0.0.1:{} (lives while gray runs)", DEFAULT_PORT);
+                    println!(
+                        "webchat — local chat at http://127.0.0.1:{} (lives while gray runs)",
+                        DEFAULT_PORT
+                    );
                     return;
                 }
-                let _ = sidecar(); return;
+                let _ = sidecar();
+                return;
             }
-            eprintln!("unknown verb"); std::process::exit(1);
+            eprintln!("unknown verb");
+            std::process::exit(1);
         }
     }
 }
